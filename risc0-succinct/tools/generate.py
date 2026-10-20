@@ -4,7 +4,7 @@
 The script is specialized to the recursion circuit (RECURSION:rev1v1, po2 18) and to one statement: the
 control ID (code root), the control root it must be a leaf of, the inner control root and the claim digest in the
 output globals.
-Everything else -- the seal, the control-ID inclusion proof and per-query DEEP quotient hints -- is witness.
+Everything else -- the seal and per-query DEEP inverse hints -- is witness.
 
 All field values are packed: an extension element is four 96-bit lanes of one integer (see packed.py). Row
 values are kept in RISC Zero's Montgomery (R-scaled) form; every check is linear in them, so the R factor is
@@ -17,12 +17,12 @@ import struct
 from pathlib import Path
 
 import babybear as bb
-import compress
+import gsr_tooling
 import packed as pk
 import reference as ref
 import witness as wit
 from babybear import P
-from field import FN_SPREAD, Field, norm
+from field import FN_MUL, FN_SPREAD, Field, norm
 from gsr import Asm, Script, V, assemble, renumber_calls
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +45,7 @@ QUERY_ITEMS = ["accum", "accum_path", "code", "code_path", "data", "data_path", 
 # outputs (u64 LE amount, compact-size scriptPubKey), i.e. the BIP 341 `sha_outputs` preimage.
 OUTPUTS_SELECTOR = bytes([0x00, 0x01, 0x00, 0x02, 0x00, 0x03])
 CLAIM_OUT = 16
-SETUP_ITEMS = ["out", "ctrl_index", "ctrl_path", "code_top", "data_top", "accum_top", "check_top", "coeff",
+SETUP_ITEMS = ["out", "code_top", "data_top", "accum_top", "check_top", "coeff",
                "fri_top0", "fri_top1", "fri_top2", "final"]
 
 
@@ -68,6 +68,15 @@ class Statement:
         self.covenant = covenant
         if receipt["hashfn"] != "sha-256-padded" or receipt["circuit_info"] != "RECURSION:rev1v1":
             raise ValueError("unsupported receipt parameters")
+        # Both ends of the control ID's inclusion proof are constants, so it is checked here instead of in Script.
+        proof = receipt["control_inclusion_proof"]
+        node, index = self.control_id, int(proof["index"])
+        for digest in proof["digests"]:
+            sibling = bytes.fromhex(digest)
+            node = hashlib.sha256(sibling + node if index & 1 else node + sibling).digest()
+            index >>= 1
+        if index or node != self.control_root:
+            raise ValueError("the control ID is not a leaf of the control root")
         if covenant:
             claim = receipt["claim"]
             if claim["assumptions_digest"] != "00" * 32 or (claim["sys_exit"], claim["user_exit"]) != (0, 0):
@@ -215,54 +224,89 @@ class Gen:
 
     @staticmethod
     def top_root(a: Asm, top: V, n: int) -> V:
-        level = []
-        for i in range(n // 2):
-            a.pick(top)
-            a.push(64 * i)
-            a.push(64)
-            level.append(a.op("SUBSTR", 3, V()).op("SHA256", 1, V("h")).top())
-        while len(level) > 1:
-            nxt = []
-            for j in range(0, len(level), 2):
-                a.roll(level[j])
-                a.roll(level[j + 1])
-                nxt.append(a.op("CAT", 2, V()).op("SHA256", 1, V("h")).top())
-            level = nxt
-        return level[0]
-
-    @staticmethod
-    def merkle(a: Asm, row: V, path: V, levels: int, bits: list[V], top: V, toff: V) -> None:
-        a.pick(row)
-        a.op("SHA256", 1, V("cur"))
-        for k in range(levels):
-            a.pick(path)
-            a.push(32 * k)
-            a.push(32)
-            a.op("SUBSTR", 3, V())
-            a.pick(bits[k])
-            a.raw(assemble(["IF", "SWAP", "ENDIF", "CAT", "SHA256"]), 3, V("cur"))
+        """Root of the n-node Merkle top. Each level is a string of nodes; every step is the same code on
+        (level acc): hash the level's first two nodes onto acc and drop them."""
         a.pick(top)
-        a.pick(toff)
-        a.push(32)
-        a.op("SUBSTR", 3, V())
-        a.raw(assemble(["EQUAL", "VERIFY"]), 2)
+        while n > 1:
+            a.push(b"")
+            for _ in range(n // 2):
+                a.raw(assemble(["OVER", 64, "LEFT", "SHA256", "CAT", "SWAP", "SIZE", 64, "SUB", "RIGHT", "SWAP"]), 2,
+                      V("level"), V("acc"))
+            a.raw(assemble(["NIP"]), 2, V("level"))
+            n //= 2
+        return a.top()
 
     @staticmethod
-    def column(a: Asm, x: V, stride: int, i: int, consts: dict) -> V:
-        """Extension element from words (i, i+stride, i+2 stride, i+3 stride) of `x`, packed into 96-bit lanes:
-        mask the four words, then one multiplication moves word j from bit 32*stride*j to 3G + 96 j."""
-        a.pick(x)
-        if i:
-            a.push(32 * i)
-            a.op("RSHIFT", 2, V())
-        a.pick(consts[f"mcol{stride}"])
-        a.op("AND", 2, V())
-        a.pick(consts[f"ccol{stride}"])
-        a.op("MUL", 2, V())
-        a.push(3 * (32 * stride - pk.W))
-        a.op("RSHIFT", 2, V())
-        a.pick(consts["mask4"])
-        return a.op("AND", 2, V("col", P, True)).top()
+    def merkle(a: Asm, row: V, path: V, levels: int, idx: V, top: V, consume: bool = False) -> None:
+        """`path` (consumed) authenticates `row` as leaf `idx` under node idx >> levels of `top`. Every level is the
+        same code on (path idx node): the sibling is the path's first 32 bytes, ordered by idx's low bit."""
+        a.roll(path)
+        a.fetch(idx, consume)
+        a.pick(row)
+        a.op("SHA256", 1, V("node"))
+        for _ in range(levels):
+            a.raw(assemble([2, "PICK", 32, "LEFT", 2, "PICK", 1, "AND", 0, "ADD", "IF", "SWAP", "ENDIF", "CAT",
+                            "SHA256", "ROT", "SIZE", 32, "SUB", "RIGHT", "ROT", "2DIV", "ROT"]), 3,
+                  V("path"), V("idx"), V("node"))
+        rest, i = a.top(2), a.top(1)
+        a.pick(top)
+        a.roll(i)
+        a.raw(assemble([32, "MUL", 32, "SUBSTR", "EQUAL", "VERIFY"]), 3)
+        a.drop(rest)
+
+    @staticmethod
+    def insert_column(a: Asm, part: V, q4: V, x: V) -> V:
+        """The 64-word FRI row from `part`, its 60 other words, with the canonical extension element `x` as column
+        q4 / 4: word k of x goes before word q4 / 4 of the k-th 15-word segment. Setting bit 320 of x keeps the
+        bytes of every 96-bit lane, so word k is bytes 12k..12k+4."""
+        a.roll(x)
+        xb = a.raw(assemble([1, 8 * 40, "LSHIFT", "OR"]), 1, V("xb")).top()
+        row = None
+        for k in range(4):
+            a.pick(part)
+            a.push(60 * k)
+            a.push(60)
+            seg = a.op("SUBSTR", 3, V("seg")).top()
+            a.pick(seg)
+            a.pick(q4)
+            a.op("LEFT", 2, V())
+            a.pick(xb)
+            a.push(12 * k)
+            a.push(4)
+            a.op("SUBSTR", 3, V())
+            a.op("CAT", 2, V())
+            a.roll(seg)
+            a.pick(q4)
+            a.push(60)
+            a.op("SUBSTR", 3, V())
+            piece = a.op("CAT", 2, V("piece")).top()
+            if row is not None:
+                a.roll(row)
+                a.roll(piece)
+                piece = a.op("CAT", 2, V("row")).top()
+            row = piece
+        a.drop(xb)
+        a.drop(part)
+        return row
+
+    @staticmethod
+    def columns(a: Asm, x: V, stride: int, n: int, consts: dict) -> list[V]:
+        """Extension elements 0..n-1 of `x`, element i from words (i, i+stride, i+2 stride, i+3 stride), packed into
+        96-bit lanes: mask the four words, then one multiplication moves word j from bit 32*stride*j to 3G + 96 j.
+        Every element is the same code on (mcol ccol mask4 x): extract element 0 to the altstack, then shift x down
+        one word."""
+        for v in (consts[f"mcol{stride}"], consts[f"ccol{stride}"], consts["mask4"], x):
+            a.pick(v)
+        step = assemble(["DUP", 4, "PICK", "AND", 3, "PICK", "MUL", 3 * (32 * stride - pk.W), "RSHIFT", 2, "PICK",
+                         "AND", "TOALTSTACK", 32, "RSHIFT"])
+        for _ in range(n):
+            a.raw(step, 1, V("x"))
+        a.raw(assemble(["2DROP", "2DROP"]), 4)
+        cols = [V("col", P, True) for _ in range(n)]
+        for c in reversed(cols):
+            a.s.op("FROMALTSTACK")
+            a.st.append(c)
+        return cols
 
     @staticmethod
     def column_consts(stride: int) -> tuple[int, int]:
@@ -274,8 +318,11 @@ class Gen:
     # ---- constraint evaluation (poly_ext), one straight-line block in the main script ----
     def poly_ext(self, f: Field, eval_u: list, out_vals: dict, mix: list[V], poly_mix: V) -> V:
         block = self.circuit["poly_ext"]["block"]
+        # fp entries are constants or `Lazy` cells; a cell's operation is emitted on its first use, so most
+        # intermediates are computed just before they are consumed and sit at the top of the stack.
         fp: list = []
-        mx: list = []
+        mx: list = []  # constraint chain steps; mx_len: the number of poly_mix powers each chain spans
+        mx_len: list[int] = []
         pows = {1: poly_mix}
 
         def powmix(e: int) -> V:
@@ -284,23 +331,82 @@ class Gen:
                 pows[e] = f.mul(powmix(h), powmix(e - h))
             return pows[e]
 
-        def prep(i: int, limit: int) -> None:
-            v = fp[i]
-            if isinstance(v, V) and v.bound > limit:
-                fp[i] = f.reduce(v, consume=False)
+        def val(x):
+            """Emit `x` and the operands it needs, depth first (iteratively: the chains are thousands deep)."""
+            if not isinstance(x, Lazy):
+                return x
+            todo = [x]
+            while todo:
+                c = todo[-1]
+                op, a, b = c.op if c.v is None else (None, None, None)
+                need = [d for d in ((b, a) if op == "Sub" else (a, b)) if isinstance(d, Lazy) and d.v is None]
+                if need:
+                    todo.append(need[0])
+                    continue
+                todo.pop()
+                if c.v is None:
+                    c.v = emit(op, a, b)
+            return x.v
 
-        def scaled(term, e: int):
-            """poly_mix^e * term."""
-            if e == 0:
-                return term
-            if isinstance(term, V) and term.ext and term.bound > pk.MUL_IN_BOUND:
-                term = f.reduce(term, consume=False)
-            return f.mul(powmix(e), term)
+        def prep(x, limit: int) -> None:
+            if isinstance(x, Lazy) and x.v.bound > limit:
+                x.v = f.reduce(x.v, consume=False)
 
-        def add_tot(tot, term):
-            if isinstance(tot, int) and tot == 0:
-                return term
-            return f.add(tot, term)
+        def emit(op: str, x, y) -> V:
+            if op == "Add":
+                return f.add(val(x), val(y))
+            if op == "Sub":
+                val(y)
+                return f.sub(val(x), val(y))
+            val(x), val(y)
+            if isinstance(x, Lazy) and isinstance(y, Lazy):
+                if x.v.ext and y.v.ext:
+                    prep(x, pk.MUL_IN_BOUND)
+                    prep(y, pk.MUL_IN_BOUND)
+                elif x.v.bound * y.v.bound >= 1 << 95:
+                    prep(x if x.v.bound >= y.v.bound else y, 1 << 35)
+            return f.mul(val(x), val(y))
+
+        def zero(x) -> bool:
+            return isinstance(x, int) and x == 0
+
+        def term_zero(item) -> bool:
+            if item[0] == "Eqz":
+                return zero(item[2])
+            k = item[3]
+            return zero(item[2]) or all(term_zero(mx[j]) for j in chain(k))
+
+        def chain(k: int) -> list[int]:
+            """The steps of the constraint chain ending at mx[k], last first."""
+            steps = []
+            while mx[k][0] != "True":
+                steps.append(k)
+                k = mx[k][1]
+            return steps
+
+        def horner(k: int):
+            """The chain's value, sum of c_i poly_mix^E_i, by Horner's rule from its last term: acc = c_i +
+            poly_mix^w_i acc, w_i = 1 for AndEqz and the inner chain's length for AndCond. Zero terms only raise the
+            pending exponent."""
+            acc, pend = 0, 0
+            for j in chain(k):
+                item = mx[j]
+                w = 1 if item[0] == "Eqz" else mx_len[item[3]]
+                if term_zero(item):
+                    pend += w
+                    continue
+                if not zero(acc):
+                    acc = f.mul(acc, powmix(pend + w))
+                if item[0] == "Eqz":
+                    c = val(item[2])
+                else:
+                    inner, cond = horner(item[3]), item[2]
+                    c = inner if (isinstance(cond, int) and cond == 1) else f.mul(val(cond), inner)
+                acc = c if zero(acc) else f.add(acc, c)
+                pend = 0
+            if not zero(acc) and pend:
+                acc = f.mul(acc, powmix(pend))
+            return acc
 
         for step in block:
             op = step[0]
@@ -309,55 +415,40 @@ class Gen:
             elif op == "ConstExt":
                 fp.append(norm(tuple(step[1:5])))
             elif op == "Get":
-                fp.append(eval_u[step[1]])
+                fp.append(Lazy(eval_u[step[1]]))
             elif op == "GetGlobal":
-                fp.append(out_vals[step[2]] if step[1] == 0 else mix[step[2]])
+                fp.append(Lazy(out_vals[step[2]] if step[1] == 0 else mix[step[2]]))
             elif op in ("Add", "Sub", "Mul"):
                 x, y = fp[step[1]], fp[step[2]]
-                cx, cy = not isinstance(x, V), not isinstance(y, V)
+                cx, cy = not isinstance(x, Lazy), not isinstance(y, Lazy)
                 if cx and cy:
                     fx, fy = bb_ext(x), bb_ext(y)
                     r = bb.add(fx, fy) if op == "Add" else bb.sub(fx, fy) if op == "Sub" else bb.mul(fx, fy)
                     fp.append(norm(r))
-                    continue
-                if op == "Add":
-                    fp.append(y if cx and x == 0 else x if cy and y == 0 else f.add(x, y))
+                elif op == "Add":
+                    fp.append(y if cx and x == 0 else x if cy and y == 0 else Lazy(op=(op, x, y)))
                 elif op == "Sub":
-                    fp.append(x if cy and y == 0 else f.sub(x, y))
+                    fp.append(x if cy and y == 0 else Lazy(op=(op, x, y)))
+                elif (cx and x == 0) or (cy and y == 0):
+                    fp.append(0)
+                elif cx and x == 1:
+                    fp.append(y)
+                elif cy and y == 1:
+                    fp.append(x)
                 else:
-                    if (cx and x == 0) or (cy and y == 0):
-                        fp.append(0)
-                    elif cx and x == 1:
-                        fp.append(y)
-                    elif cy and y == 1:
-                        fp.append(x)
-                    else:
-                        if isinstance(x, V) and isinstance(y, V) and x.ext and y.ext:
-                            prep(step[1], pk.MUL_IN_BOUND)
-                            prep(step[2], pk.MUL_IN_BOUND)
-                        elif isinstance(x, V) and isinstance(y, V):
-                            if x.bound * y.bound >= 1 << 95:
-                                prep(step[1] if x.bound >= y.bound else step[2], 1 << 35)
-                        fp.append(f.mul(fp[step[1]], fp[step[2]]))
+                    fp.append(Lazy(op=(op, x, y)))
             elif op == "True":
-                mx.append((0, 0))
+                mx.append(("True",))
+                mx_len.append(0)
             elif op == "AndEqz":
-                tot, e = mx[step[1]]
-                term = fp[step[2]]
-                if not (isinstance(term, int) and term == 0):
-                    tot = add_tot(tot, scaled(term, e))
-                mx.append((tot, e + 1))
+                mx.append(("Eqz", step[1], fp[step[2]]))
+                mx_len.append(mx_len[step[1]] + 1)
             elif op == "AndCond":
-                tot, e = mx[step[1]]
-                itot, ie = mx[step[3]]
-                cond = fp[step[2]]
-                if not (isinstance(itot, int) and itot == 0) and not (isinstance(cond, int) and cond == 0):
-                    t = itot if (isinstance(cond, int) and cond == 1) else f.mul(cond, itot)
-                    tot = add_tot(tot, scaled(t, e))
-                mx.append((tot, e + ie))
+                mx.append(("Cond", step[1], fp[step[2]], step[3]))
+                mx_len.append(mx_len[step[1]] + mx_len[step[3]])
             else:
                 raise ValueError(op)
-        tot = mx[self.circuit["poly_ext"]["ret"]][0]
+        tot = horner(self.circuit["poly_ext"]["ret"])
         assert isinstance(tot, V)
         return tot
 
@@ -370,47 +461,30 @@ class Gen:
         taps = self.taps
 
         # position-derived values
-        a.pick(pos)
-        bits = []
-        for _ in range(TRACE_LEVELS):
-            b = V("bit", 2)
-            a.raw(assemble(["DUP", 1, "AND", 0, "ADD", "SWAP", "2DIV"]), 1, b, V("p"))
-            bits.append(b)
-        a.op("DROP", 1)
-
         def derived(ops: list, tag: str, bnd: int = 1 << 20) -> V:
             a.pick(pos)
             a.raw(assemble(ops), 1, V(tag, bnd))
             return a.top()
 
-        toff = derived([10, "RSHIFT", 992, "AND"], "toff")
-        fri_toff = [derived([6, "RSHIFT", 992, "AND"], "t0"), derived([2, "RSHIFT", 992, "AND"], "t1"),
-                    derived([4, "MUL", 992, "AND"], "t2")]
-        quot = [derived([16, "RSHIFT"], "q0"), derived([12, "RSHIFT", 15, "AND"], "q1"),
-                derived([8, "RSHIFT", 15, "AND"], "q2")]
-        nib = [derived([4, "MUL", 60, "AND"], "n0")]
-        nib += [derived([4 * k - 2, "RSHIFT", 60, "AND"], f"n{k}") for k in range(1, 5)]
-        a.drop(pos)
+        fri_leaf = [derived([(1 << 16 - 4 * r) - 1, "AND"], f"leaf{r}") for r in range(FRI_ROUNDS)]
+        # 4 * the queried column of FRI round r's row: 4 * (pos >> 16 - 4r & 15)
+        quot4 = [derived([14 - 4 * r, "RSHIFT", 60, "AND"], f"q{r}") for r in range(FRI_ROUNDS)]
 
-        def power(base: int, windows: int, tag: str) -> V:
-            acc: V | None = None
-            for k in range(windows):
-                table = b"".join(struct.pack("<I", pow(base, v << (4 * k), P)) for v in range(16))
-                a.push(table)
-                a.pick(nib[k])
-                a.push(4)
-                a.op("SUBSTR", 3, V("t", P))
-                if acc is not None:
-                    a.raw(assemble(["MUL", P, "MOD"]), 2, V(tag, P))
-                acc = a.top()
-            assert acc is not None
-            return acc
+        def power(base: int, bits: int, tag: str) -> V:
+            """base^(pos mod 2^bits) by square-and-multiply from the low bit: every bit is the same code on
+            (acc base^(2^i) pos >> i)."""
+            a.push(1)
+            a.push(base)
+            a.pick(pos)
+            for _ in range(bits):
+                a.raw(assemble(["DUP", 1, "AND", 0, "ADD", "IF", "ROT", 2, "PICK", "MUL", P, "MOD", "ROT", "ROT",
+                                "ENDIF", "SWAP", "DUP", "MUL", P, "MOD", "SWAP", "2DIV"]), 3, V(), V(), V())
+            a.raw(assemble(["2DROP"]), 3, V(tag, P))
+            return a.top()
 
-        x = power(bb.ROU_FWD[DOMAIN_PO2], 5, "x")
-        s_r = [power(bb.ROU_REV[FRI_DOMAIN_PO2[r] + 4], [4, 3, 2][r], f"s{r}") for r in range(FRI_ROUNDS)]
-        xf = power(bb.ROU_FWD[FRI_DOMAIN_PO2[-1]], 2, "xf")
-        for v in nib:
-            a.drop(v)
+        x = power(bb.ROU_FWD[DOMAIN_PO2], 20, "x")
+        s_r = [power(bb.ROU_REV[FRI_DOMAIN_PO2[r] + 4], 16 - 4 * r, f"s{r}") for r in range(FRI_ROUNDS)]
+        xf = power(bb.ROU_FWD[FRI_DOMAIN_PO2[-1]], 8, "xf")
 
         # trace and check rows
         rows = {}
@@ -420,9 +494,9 @@ class Gen:
             self.range_check(a, row, pv["masks"])
             path = a.roll(items[g + "_path"])
             self.size_check(a, path, 32 * TRACE_LEVELS)
-            self.merkle(a, row, path, TRACE_LEVELS, bits, pv[g + "_top"], toff)
-            a.drop(path)
+            self.merkle(a, row, path, TRACE_LEVELS, pos, pv[g + "_top"])
             rows[g] = row
+        a.drop(pos)
         groups = {ref.GROUP_ACCUM: "accum", ref.GROUP_CODE: "code", ref.GROUP_DATA: "data"}
 
         # tot_c = sum over registers of mix^r * row value
@@ -431,18 +505,29 @@ class Gen:
             members[reg["combo"]].append((r, groups[reg["group"]], reg["offset"]))
         for i in range(ref.CHECK_SIZE):
             members[CHECK_COMBO].append((taps.reg_count + i, "check", i))
+        # A run of registers with consecutive row words and indices reads the row from its front: each term is the
+        # same code on (row tail), mix^r staying at a fixed depth as the terms pile up.
         tot = []
         for c in range(CHECK_COMBO + 1):
             terms = []
+            prev = None
             for r, g, off in members[c]:
-                a.pick(rows[g])
-                a.push(4 * off)
-                a.push(4)
-                a.op("SUBSTR", 3, V("w", P))
+                if prev != (r - 1, g, off - 1):
+                    if prev is not None:
+                        a.drop(tail)
+                    a.pick(rows[g])
+                    a.push(4 * off)
+                    a.push(4 * self.layout.rows[g])
+                    tail = a.op("SUBSTR", 3, V("tail")).top()
+                a.raw(assemble(["DUP", 4, "LEFT"]), 0, V("w", P))
                 if r:
                     a.pick(pv["mixpow"][r])
                     a.op("MUL", 2, V("mw", pk.REDUCED * P, True))
                 terms.append(a.top())
+                tail = V("tail")
+                a.raw(assemble(["SWAP", "SIZE", 4, "SUB", "RIGHT"]), 2, terms[-1], tail)
+                prev = (r, g, off)
+            a.drop(tail)
             tot.append(f.reduce(f.sum(terms)))
         for g in rows:
             a.drop(rows[g])
@@ -451,19 +536,15 @@ class Gen:
         for _ in range(6):
             xp.append(f.reduce(f.mul(xp[-1], x)))
 
-        hints = a.roll(items["hints"])
-        self.size_check(a, hints, 16 * (CHECK_COMBO + 1))
-        self.range_check(a, hints, pv["masks"])
-        qv = []
-        for c in range(CHECK_COMBO + 1):
-            a.pick(hints)
-            a.push(16 * c)
-            a.push(16)
-            a.op("SUBSTR", 3, V())
-            qv.append(f.fn(FN_SPREAD, pk.spread_ops(), 1, V("q", 1 << 32, True)))
-        a.drop(hints)
+        hint = a.roll(items["hints"])
+        self.size_check(a, hint, 16)
+        self.range_check(a, hint, pv["masks"])
+        a.roll(hint)
+        inv = f.fn(FN_SPREAD, pk.spread_ops(), 1, V("inv", 1 << 32, True))
 
-        # q_c * D_c(x) == tot_c - U_c(x)
+        # goal = sum_c (tot_c - U_c(x)) / D_c(x) = num / den with num = sum_c (tot_c - U_c) prod_{j != c} D_j and
+        # den = prod_c D_c; the hint is 1 / den
+        num = den = None
         for c in range(CHECK_COMBO + 1):
             dco = pv["dcoef"][c]
             n = len(dco)
@@ -477,30 +558,28 @@ class Gen:
             for k in range(1, len(cu)):
                 terms.append(f.mul(cu[k], xp[k]))
             u = f.sum(terms)
-            e = f.mul(qv[c], d, cy=True)
-            e = f.add(e, u, True, True)
-            e = f.sub(e, tot[c], True, True)
-            f.canon(e)
-            a.raw(assemble([0, "NUMEQUAL", "VERIFY"]), 1)
-        for v in qv:
-            a.roll(v)
-        goal = f.reduce(f.sum(qv))
+            n = f.sub(tot[c], u, True, True)
+            if num is None:
+                num, den = n, d
+            else:
+                num = f.add(f.mul(num, d, True), f.mul(n, den, True), True, True)
+                den = f.mul(den, d, True, True)
+        f.canon(f.mul(den, inv, True))
+        a.raw(assemble([1, "NUMEQUAL", "VERIFY"]), 1)
+        goal = f.reduce(f.mul(num, inv, True, True))
 
-        # FRI rounds
+        # FRI rounds: the queried column of each row is the goal, so the witness leaves it out and the Script
+        # inserts the goal before the Merkle check
         for r in range(FRI_ROUNDS):
-            row = a.roll(items[f"fri{r}"])
-            self.size_check(a, row, 256)
-            self.range_check(a, row, pv["masks"])
+            part = a.roll(items[f"fri{r}"])
+            self.size_check(a, part, 240)
+            self.range_check(a, part, pv["masks"])
+            row = self.insert_column(a, part, quot4[r], f.canon(goal))
+            a.drop(quot4[r])
             path = a.roll(items[f"fri{r}_path"])
             self.size_check(a, path, 32 * FRI_LEVELS[r])
-            self.merkle(a, row, path, FRI_LEVELS[r], bits, pv[f"fri_top{r}"], fri_toff[r])
-            a.drop(path)
-            gc = f.canon(goal)
-            cols = [self.column(a, row, 16, i, pv) for i in range(16)]
-            a.pick(quot[r])
-            a.raw(assemble([15, "SWAP", "SUB", "PICK"]), 1, V("dq"))
-            a.pick(gc)
-            a.raw(assemble(["NUMEQUAL", "VERIFY"]), 2)
+            self.merkle(a, row, path, FRI_LEVELS[r], fri_leaf[r], pv[f"fri_top{r}"], consume=True)
+            cols = self.columns(a, row, 16, 16, pv)
             y = f.reduce(f.mul(pv["rmix"][r], s_r[r]))
             lvl, ys, w = cols, y, bb.ROU_REV[4]
             while len(lvl) > 1:
@@ -520,14 +599,20 @@ class Gen:
             goal = f.reduce(f.mul(lvl[0], pow(16, P - 2, P), True))
             a.drop(row)
 
-        # final polynomial at xf
-        xfp = [1, xf]
-        for _ in range(FINAL_DEGREE - 2):
-            xfp.append(f.reduce(f.mul(xfp[-1], xf)))
-        terms = [f.fetch(pv["final"][0])]
-        for k in range(1, FINAL_DEGREE):
-            terms.append(f.mul(pv["final"][k], xfp[k]))
-        fx = f.canon(f.sum(terms))
+        # final polynomial at xf: sum_k c_k xf^k, every term by the same code on (xf acc p x): c_k is words
+        # (0, 64, 128, 192) of x, acc += c_k p, p = p xf mod P, drop x's first word
+        a.roll(xf)
+        a.push(0)
+        a.push(1)
+        a.pick(pv["final"])
+        words = ["DUP", 4, "LEFT"] + [op for k in (1, 2, 3) for op in ("OVER", 256 * k, 4, "SUBSTR", "CAT")]
+        for _ in range(FINAL_DEGREE):
+            a.raw(assemble(words), 0, V())
+            f.fn(FN_SPREAD, pk.spread_ops(), 1, V())
+            a.raw(assemble([2, "PICK", "MUL", 3, "ROLL", "ADD", "ROT", 3, "PICK", "MUL", P, "MOD", "ROT", "SIZE", 4,
+                            "SUB", "RIGHT"]), 4, V("acc"), V("p"), V("x"))
+        a.raw(assemble(["2DROP", "NIP"]), 4, V("fx", FINAL_DEGREE * P * P, True))
+        fx = f.canon(a.top())
         f.canon(goal)
         a.roll(fx)
         a.raw(assemble(["NUMEQUAL", "VERIFY"]), 2)
@@ -652,7 +737,7 @@ class Gen:
                 out_vals[i] = m.raw(assemble(["MUL", P, "MOD"]), 2, V(f"out{i}", P)).top()
         m.drop(out)
 
-        # trace commitments; the code root must be a leaf of the control root
+        # trace commitments; the code root must be the control ID (a leaf of the control root, see Statement)
         tops = {}
         for g in ("code", "data", "accum", "check"):
             t = m.roll(s_items[g + "_top"])
@@ -662,27 +747,6 @@ class Gen:
             if g == "code":
                 m.pick(root)
                 m.push(self.stmt.control_id)
-                m.raw(assemble(["EQUAL", "VERIFY"]), 2)
-                idx = m.roll(s_items["ctrl_index"])
-                path = m.roll(s_items["ctrl_path"])
-                self.size_check(m, path, 32 * 8)
-                cur = m.pick(root)
-                for k in range(8):
-                    m.roll(cur)
-                    m.pick(path)
-                    m.push(32 * k)
-                    m.push(32)
-                    m.op("SUBSTR", 3, V())
-                    m.pick(idx)
-                    cur = m.raw(assemble([1, "AND", 0, "ADD", "IF", "SWAP", "ENDIF", "CAT", "SHA256"]), 3,
-                                V("cur")).top()
-                    m.roll(idx)
-                    idx = m.op("2DIV", 1, V("idx")).top()
-                m.drop(path)
-                m.roll(idx)
-                m.raw(assemble([0, "NUMEQUAL", "VERIFY"]), 1)
-                m.roll(cur)
-                m.push(self.stmt.control_root)
                 m.raw(assemble(["EQUAL", "VERIFY"]), 2)
             rng.mix(root)
             if g == "data":
@@ -711,25 +775,41 @@ class Gen:
                 m.op("SUBSTR", 3, V())
                 raw.append(f.fn(FN_SPREAD, pk.spread_ops(), 1, V("coef", P, True)))
             m.drop(chunk)
-        m.drop(coeff)
 
         # eval_u: coefficient j of a register's polynomial is raw_j * R^-1, evaluated at z * back_one^back
         zp: list = [None, z]
         for _ in range(6):
             zp.append(f.mul(zp[-1], z))
         zr = [bb.R_INV] + [f.reduce(f.mul(zp[j], bb.R_INV)) for j in range(1, 7)]
+        # Each register re-reads its coefficients from the front of (a copy of) the coefficient bytes and moves its
+        # tap values to the altstack, so all registers of a combo are the same code on (copies of zr_1 .. zr_5,
+        # coeff).
         back_one = bb.ROU_REV[PO2]
+        zc = [zr[0]] + [m.pick(v) for v in zr[1:6]]
+        rest = m.roll(coeff)
         eval_u: list[V] = []
-        off = 0
         for reg in taps.regs:
-            coefs = [f.mul(raw[off + j], zr[j]) for j in range(reg["size"])]
+            coefs = []
+            for j in range(reg["size"]):
+                m.roll(rest)
+                m.raw(assemble(["DUP", 16, "LEFT"]), 0, V())
+                c = f.fn(FN_SPREAD, pk.spread_ops(), 1, V("coef", P, True))
+                rest = V("coeff")
+                m.raw(assemble(["SWAP", "SIZE", 16, "SUB", "RIGHT"]), 2, c, rest)
+                coefs.append(f.mul(c, zc[j]))
             for back in reg["backs"]:
                 terms = [f.fetch(coefs[0])]
                 for j in range(1, reg["size"]):
                     c = pow(back_one, back * j, P)
                     terms.append(f.fetch(coefs[j]) if c == 1 else f.mul(coefs[j], c))
                 eval_u.append(f.sum(terms))
-            off += reg["size"]
+                m.op("TOALTSTACK", 1)
+        for v in zc[1:] + [rest]:
+            if m.has(v):
+                m.drop(v)
+        for v in reversed(eval_u):
+            m.s.op("FROMALTSTACK")
+            m.st.append(v)
 
         result = self.poly_ext(f, eval_u, out_vals, mix, poly_mix)
 
@@ -757,10 +837,16 @@ class Gen:
         m.raw(assemble([pk.W, "RSHIFT", "VERIFY"]), 1)
 
         # FRI batching constants
+        # powers of fri_mix, each by the same code on (power fri_mix): OVER OVER mul SWAP
         fri_mix = rng.ext()
         mixpow = [1, fri_mix]
+        assert m.top() is fri_mix and fri_mix.bound <= pk.MUL_IN_BOUND
+        m.raw(assemble(["DUP"]), 0, V("fri_mix", fri_mix.bound, True))
         for _ in range(taps.reg_count + ref.CHECK_SIZE - 2):
-            mixpow.append(f.mul(mixpow[-1], fri_mix))
+            m.raw(assemble(["OVER", "OVER"]), 0, V(), V())
+            mixpow.append(f.fn(FN_MUL, pk.ext_mul_ops(), 2, V("*", pk.REDUCED, True)))
+            m.raw(assemble(["SWAP"]), 2, mixpow[-1], m.top(1))
+        m.drop(m.top())
         cu_terms: list[list[tuple[int, int]]] = [[] for _ in range(taps.tot_combo_backs + 1)]
         off = 0
         for r, reg in enumerate(taps.regs):
@@ -808,14 +894,9 @@ class Gen:
         self.size_check(m, final, 16 * FINAL_DEGREE)
         self.range_check(m, final, masks)
         commit_bytes(final)
-        consts = {}
-        for stride in (16, 64):
-            mc, cc = self.column_consts(stride)
-            consts[f"mcol{stride}"] = m.push(mc, V(f"mcol{stride}"))
-            consts[f"ccol{stride}"] = m.push(cc, V(f"ccol{stride}"))
-        consts["mask4"] = m.push(pk.EXT_MASK4, V("mask4"))
-        final_c = [self.column(m, final, 64, k, consts) for k in range(FINAL_DEGREE)]
-        m.drop(final)
+        mc, cc = self.column_consts(16)
+        consts = {"mcol16": m.push(mc, V("mcol16")), "ccol16": m.push(cc, V("ccol16")),
+                  "mask4": m.push(pk.EXT_MASK4, V("mask4"))}
 
         blob = m.pick(rng.p0)
         for _ in range(6):
@@ -824,26 +905,17 @@ class Gen:
             m.pick(rng.p0)
             blob = m.op("CAT", 2, V("posblob")).top()
 
-        # compact everything the queries need into a fixed persistent block
-        pv = {"masks": short, "mixpow": mixpow, "cu": cu, "dcoef": dcoef, "rmix": rmix, "final": final_c,
-              "mcol16": consts["mcol16"], "ccol16": consts["ccol16"], "mask4": consts["mask4"]}
+        # everything the queries need stays where it is: one more planned access keeps it live, and the query
+        # body addresses the whole stack above the query items (`persist`, dead values included)
+        pv = {"masks": short, "mixpow": mixpow, "cu": cu, "dcoef": dcoef, "rmix": rmix, "final": final, **consts}
         pv.update({g + "_top": tops[g] for g in ("code", "data", "accum", "check")})
         pv.update({f"fri_top{r}": tops[f"fri_top{r}"] for r in range(FRI_ROUNDS)})
-        keep: list = list(short.values()) + [consts["mcol16"], consts["ccol16"], consts["mask4"]]
+        keep: list = list(short.values()) + list(consts.values())
         keep += [tops[k] for k in ("code", "data", "accum", "check")] + [tops[f"fri_top{r}"] for r in range(3)]
-        keep += mixpow[1:] + cu_flat + [v for d in dcoef for v in d] + rmix + final_c + [blob]
+        keep += mixpow[1:] + cu_flat + [v for d in dcoef for v in d] + rmix + [final, blob]
         assert all(isinstance(v, V) for v in keep)
-        for v in reversed(keep):
-            m.pick(v)
-            m.op("TOALTSTACK", 1)
-        region = len(m.st) - len(base)
-        m.s.drop_n(region)
-        m.st = list(base)
-        copies = []
         for v in keep:
-            m.s.op("FROMALTSTACK")
-            m.st.append(v)
-            copies.append(v)
+            m.access(v)
         persist = list(m.st[len(base):])
         m.active = False
 
@@ -880,40 +952,49 @@ class Gen:
         main.code = bytearray(renumber_calls(bytes(head.code + m.s.code), index))
         script = Script().extend(decls).extend(main)
         info = {"functions": {fid: sizes[fid] for fid in self.used}, "decl_len": len(decls.code),
-                # main-script byte range holding the head and the statement prologue (see compress.protect)
+                # main-script byte range holding the head and the statement prologue (see gsr_tooling.compress)
                 "head_prologue": (0, len(head.code) + prologue_len),
                 "query_body_bytes": len(body.code), "persist": len(persist), "accesses": m.accesses,
                 "pool": f.pool_candidates()}
         return script, info
 
 
+class Lazy:
+    """A poly_ext value: emitted (`v`) on first use from `op` = (name, x, y)."""
+
+    __slots__ = ("v", "op")
+
+    def __init__(self, v: V | None = None, op: tuple | None = None) -> None:
+        self.v, self.op = v, op
+
+
 def bb_ext(c) -> tuple:
     return c if isinstance(c, tuple) else bb.e(c)
 
 
-def prover_hints(gen: Gen, receipt: dict, seal: bytes) -> list[bytes]:
-    """Per-query DEEP quotient hints for a seal the reference verifier accepts."""
+def prover_hints(gen: Gen, receipt: dict, seal: bytes) -> list[tuple[bytes, int]]:
+    """Per query, the DEEP inverse hint and the query position, for a seal the reference verifier accepts."""
     trace: dict = {}
     ref.verify_receipt(receipt, seal, trace)
-    return wit.deep_hints(wit.split_seal(seal, gen.layout), trace, gen.taps)
+    return list(zip(wit.deep_hints(wit.split_seal(seal, gen.layout), trace, gen.taps),
+                    (q["pos"] for q in trace["queries"])))
 
 
-def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[bytes] | None = None) -> list[bytes]:
+def build_witness(gen: Gen, receipt: dict, seal: bytes, hints: list[tuple[bytes, int]] | None = None) -> list[bytes]:
     """Witness stack, bottom first; queries deepest (query 0 just below the setup items). `hints` lets tests
     pair any seal (including a rejected one) with chosen hints."""
     if hints is None:
         hints = prover_hints(gen, receipt, seal)
     split = wit.split_seal(seal, gen.layout)
-    proof = receipt["control_inclusion_proof"]
-    setup = {"out": split["out"], "ctrl_index": int(proof["index"]).to_bytes(4, "little").rstrip(b"\0"),
-             "ctrl_path": b"".join(bytes.fromhex(d) for d in proof["digests"]),
-             "code_top": split["code_top"], "data_top": split["data_top"], "accum_top": split["accum_top"],
-             "check_top": split["check_top"], "coeff": split["coeff"], "final": split["final"]}
+    setup = {n: split[n] for n in ("out", "code_top", "data_top", "accum_top", "check_top", "coeff", "final")}
     for r in range(FRI_ROUNDS):
         setup[f"fri_top{r}"] = split["fri_top"][r]
     stack = []
     for q in reversed(range(ref.QUERIES)):
-        items = dict(split["queries"][q], hints=hints[q])
+        hint, pos = hints[q]
+        items = dict(split["queries"][q], hints=hint)
+        for r in range(FRI_ROUNDS):
+            items[f"fri{r}"] = wit.fri_row_part(items[f"fri{r}"], pos >> (16 - 4 * r) & 15)
         stack += [items[n] for n in reversed(QUERY_ITEMS)]
     stack += [setup[n] for n in reversed(SETUP_ITEMS)]
     return stack
@@ -932,7 +1013,7 @@ def main() -> None:
     first = gen.generate()[1]
     script, info = gen.generate(first["accesses"], first["pool"])
     if args.compress:
-        code, info["compression"] = compress.compress(bytes(script.code))
+        code, info["compression"] = gsr_tooling.compress(bytes(script.code))
         script = Script()
         script.code = bytearray(code)
     info["pooled"] = len(info.pop("pool"))
