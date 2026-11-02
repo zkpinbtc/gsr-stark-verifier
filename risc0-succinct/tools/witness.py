@@ -1,7 +1,8 @@
 """Prover-side witness preparation: split a seal into the verifier's witness items and compute DEEP hints.
 
 The split is a fixed re-chunking of the seal (every seal word lands in exactly one item, in order), so the Script
-checks each item's exact size and exact consumption of the stack instead of re-parsing the seal.
+checks each item's exact size and exact consumption of the stack instead of re-parsing the seal. The one exception:
+each FRI row leaves out its queried column, which the Script inserts from its own goal (`fri_row_part`).
 """
 import struct
 
@@ -9,10 +10,11 @@ import babybear as bb
 import reference as ref
 from babybear import P
 
-TRACE_TOP = 32
-TRACE_LEVELS = 15
-FRI_LEVELS = [11, 7, 3]
+TRACE_TOP = ref.TRACE_TOP
+TRACE_LEVELS = ref.TRACE_LEVELS
+FRI_LEVELS = ref.FRI_LEVELS
 COMBOS = 5
+D = ref.D
 
 
 class Layout:
@@ -36,24 +38,36 @@ def split_seal(seal_bytes: bytes, layout: Layout) -> dict:
         pos += n
         return out
 
-    s: dict = {"out": take(33), "code_top": take(8 * TRACE_TOP), "data_top": take(8 * TRACE_TOP),
-               "accum_top": take(8 * TRACE_TOP), "check_top": take(8 * TRACE_TOP),
+    def digests(n: int) -> bytes:
+        """n seal digests (8 words each), keeping the D bytes the suite commits to."""
+        raw = take(8 * n)
+        return b"".join(raw[32 * i:32 * i + D] for i in range(n))
+
+    s: dict = {"out": take(33), "code_top": digests(TRACE_TOP), "data_top": digests(TRACE_TOP),
+               "accum_top": digests(TRACE_TOP), "check_top": digests(TRACE_TOP),
                "coeff": take(layout.coeff_words), "fri_top": [], "queries": []}
-    for _ in range(3):
-        s["fri_top"].append(take(8 * 32))
-    s["final"] = take(4 * 64)
+    for top in ref.FRI_TOP:
+        s["fri_top"].append(digests(top))
+    s["final"] = take(4 * ref.FINAL_DEGREE)
+    if ref.POW_BITS:
+        s["pow_nonce"] = take(1)
     for _ in range(ref.QUERIES):
         q: dict = {}
         for g in ("accum", "code", "data", "check"):
             q[g] = take(layout.rows[g])
-            q[g + "_path"] = take(8 * TRACE_LEVELS)
+            q[g + "_path"] = digests(TRACE_LEVELS)
         for r, levels in enumerate(FRI_LEVELS):
-            q[f"fri{r}"] = take(64)
-            q[f"fri{r}_path"] = take(8 * levels)
+            q[f"fri{r}"] = take(4 * ref.FRI_FOLD)
+            q[f"fri{r}_path"] = digests(levels)
         s["queries"].append(q)
     if pos != len(words):
         raise ref.VerifyError("ReceiptFormatError")
     return s
+
+
+def fri_row_part(row: bytes, column: int) -> bytes:
+    """A FRI row without the queried column (words column + 16k), which the Script inserts from its own goal."""
+    return b"".join(row[64 * k:64 * k + 4 * column] + row[64 * k + 4 * column + 4:64 * (k + 1)] for k in range(4))
 
 
 def row_words(b: bytes) -> list[int]:
@@ -61,12 +75,12 @@ def row_words(b: bytes) -> list[int]:
 
 
 def deep_hints(split: dict, trace: dict, taps: "ref.TapSet") -> list[bytes]:
-    """Per query, q_c = (tot_c - U_c(x)) / D_c(x) for the five tap combos and the check combo, over R-scaled
-    (Montgomery-word) row values; the Script checks q_c * D_c(x) == tot_c - U_c(x) instead of inverting."""
+    """Per query, 1 / prod_c D_c(x) over the five tap combos and the check combo: the Script needs
+    sum_c (tot_c - U_c(x)) / D_c(x) and checks this inverse instead of inverting."""
     z, fri_mix = trace["z"], trace["fri_mix"]
     back_one = bb.ROU_REV[trace["po2"]]
     combo_u = [bb.scale(c, bb.R) for c in trace["combo_u"]]
-    gen = bb.ROU_FWD[20]
+    gen = bb.ROU_FWD[ref.DOMAIN_PO2]
     pows, cur = [], bb.ONE
     for _ in range(taps.reg_count + ref.CHECK_SIZE):
         pows.append(cur)
@@ -80,17 +94,12 @@ def deep_hints(split: dict, trace: dict, taps: "ref.TapSet") -> list[bytes]:
             tot[reg["combo"]] = bb.add(tot[reg["combo"]], bb.scale(mp, rows[reg["group"]][reg["offset"]]))
         for i, w in enumerate(row_words(q["check"])):
             tot[-1] = bb.add(tot[-1], bb.scale(pows[taps.reg_count + i], w))
-        hint = b""
+        prod = bb.ONE
         for c in range(COMBOS + 1):
             if c < COMBOS:
-                u = bb.poly_eval(combo_u[taps.combo_begin[c]:taps.combo_begin[c + 1]], x)
-                d = bb.ONE
                 for back in taps.combo(c):
-                    d = bb.mul(d, bb.sub(x, bb.scale(z, pow(back_one, back, P))))
+                    prod = bb.mul(prod, bb.sub(x, bb.scale(z, pow(back_one, back, P))))
             else:
-                u = combo_u[taps.tot_combo_backs]
-                d = bb.sub(x, bb.power(z, 4))
-            qc = bb.mul(bb.sub(tot[c], u), bb.inv(d))
-            hint += ref.words_bytes(list(qc))
-        out.append(hint)
+                prod = bb.mul(prod, bb.sub(x, bb.power(z, 4)))
+        out.append(ref.words_bytes(list(bb.inv(prod))))
     return out
